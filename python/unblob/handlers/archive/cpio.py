@@ -460,6 +460,57 @@ class PortableASCIIWithCRCParser(PortableASCIIParser):
         return header_checksum == calculated_checksum & 0xFF_FF_FF_FF
 
 
+class StrippedCPIOParser(CPIOParserBase):
+    """a stripped CPIO variant (magic 07070X) used in RPM 4.12+."""
+
+    _PAD_ALIGN = 4
+    _MAGIC = b"07070X"
+    _HEADER_SIZE = 14  # 6 magic + 8 fx
+
+    @classmethod
+    def extract(cls, stream, fs: FileSystem, entries):  # noqa: C901
+        header_padding = cls._pad_content(cls._HEADER_SIZE) - cls._HEADER_SIZE
+        while True:
+            magic = stream.read(6)
+            # Stripped archives terminate with a standard newc TRAILER entry.
+            if magic in (b"070701", b"070702"):
+                break
+            if magic != cls._MAGIC:
+                raise InvalidInputFormat(
+                    f"Bad stripped CPIO magic: {magic} should be 07070X"
+                )
+
+            file_index = int(stream.read(8), 16)
+            stream.seek(header_padding, io.SEEK_CUR)
+
+            path, mode, size, link_target, rdev = entries[file_index]
+            content_padding = cls._pad_content(size) - size
+
+            if path.name in ("", ".", ".."):
+                stream.seek(size + content_padding, io.SEEK_CUR)
+                continue
+
+            if not stat.S_ISDIR(mode):
+                fs.unlink(path)
+
+            if stat.S_ISREG(mode):
+                fs.write_chunks(path, iterate_file(stream, stream.tell(), size))
+            elif stat.S_ISLNK(mode):
+                fs.create_symlink(src=Path(link_target), dst=path)
+                stream.seek(size, io.SEEK_CUR)
+            elif stat.S_ISDIR(mode):
+                fs.mkdir(path, mode=mode & 0o777, parents=True, exist_ok=True)
+                stream.seek(size, io.SEEK_CUR)
+            elif stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISSOCK(mode):
+                fs.mknod(path, mode=mode & 0o777, device=rdev)
+                stream.seek(size, io.SEEK_CUR)
+            else:
+                logger.warning("unknown file type in stripped CPIO archive")
+                stream.seek(size, io.SEEK_CUR)
+
+            stream.seek(content_padding, io.SEEK_CUR)
+
+
 class _CPIOExtractorBase(Extractor):
     PARSER: type[CPIOParserBase]
 
